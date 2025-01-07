@@ -77,6 +77,7 @@ fastify.all("/incoming-call-eleven", async (request, reply) => {
     <Response>
     <Connect>
         <Stream url="wss://${request.headers.host}/media-stream">
+        
             <Parameter name="From" value="${callDetails.From}" />
             <Parameter name="FromCity" value="${callDetails.FromCity || ''}" />
             <Parameter name="FromCountry" value="${callDetails.FromCountry || ''}" />
@@ -94,6 +95,7 @@ fastifyInstance.get("/media-stream", { websocket: true }, (connection, req) => {
 
     let streamSid = null;
     let elevenLabsWs = null;
+    let conversationId = null;
 
     // Handle messages from Twilio
     connection.on("message", async (message) => {
@@ -128,13 +130,13 @@ fastifyInstance.get("/media-stream", { websocket: true }, (connection, req) => {
 
             elevenLabsWs.on('message', (data) => {
                 try {
-                    // console.log('[ElevenLabs] Raw message:', data.toString());
                     const message = JSON.parse(data);
-                    // console.log('[ElevenLabs] Parsed message:', JSON.stringify(message, null, 2));
                     
                     switch (message.type) {
                         case "conversation_initiation_metadata":
                             console.info("[ElevenLabs] Initiation metadata:", JSON.stringify(message, null, 2));
+                            // Store conversation ID for later use
+                            conversationId = message.conversation_initiation_metadata_event.conversation_id;
                             break;
                         case "text":
                             console.info("[ElevenLabs] Agent response:", message.text);
@@ -162,8 +164,24 @@ fastifyInstance.get("/media-stream", { websocket: true }, (connection, req) => {
                 console.error('[ElevenLabs] WebSocket error:', error);
             });
 
-            elevenLabsWs.on('close', () => {
+            elevenLabsWs.on('close', async () => {
                 console.log('[ElevenLabs] Connection closed');
+                if (conversationId) {
+                    try {
+                        const response = await fetch(
+                            `https://api.elevenlabs.io/v1/convai/conversations/${conversationId}`,
+                            {
+                                headers: {
+                                    'xi-api-key': process.env.ELEVENLABS_API_KEY
+                                }
+                            }
+                        );
+                        const transcript = await response.json();
+                        console.log('\n[Call Ended] Conversation Transcript:', transcript);
+                    } catch (error) {
+                        console.error('[ElevenLabs] Error fetching transcript:', error);
+                    }
+                }
             });
             break;
         case "media":
