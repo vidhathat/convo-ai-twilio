@@ -5,6 +5,7 @@ import fastifyFormBody from "@fastify/formbody";
 import fastifyWs from "@fastify/websocket";
 import mongoose from "mongoose";
 import CallRecord from "./models/CallRecord.js";
+import { Conversation } from '@11labs/client';
 
 // Load environment variables from .env file
 dotenv.config();
@@ -106,24 +107,45 @@ fastifyInstance.get("/media-stream", { websocket: true }, (connection, req) => {
             console.log(`[Twilio] Stream started with ID: ${streamSid}`);
             console.log("[Twilio] Custom parameters:", customParams);
             const extraBody = {
-              "caller_id": customParams.From,
-          };
-            // Connect to ElevenLabs with caller info
+                "caller_id": customParams.From,
+            };
             const userId = encodeURIComponent(customParams.From || '');
             console.log("[II] Using caller number as user_id:", customParams.From);
-            // const wsUrl = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${ELEVENLABS_AGENT_ID}&user_id=${userId}`;
             const wsUrl = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${ELEVENLABS_AGENT_ID}&` + 
-            new URLSearchParams(extraBody).toString()
+            new URLSearchParams(extraBody).toString();
 
             console.log("[II] Full ElevenLabs WebSocket URL:", wsUrl);
 
             // Initialize ElevenLabs WebSocket connection
             console.log("[II] Attempting to connect to ElevenLabs...");
             elevenLabsWs = new WebSocket(wsUrl);
+                try {
+                    const conversation = await Conversation.startSession({
+                        agentId: ELEVENLABS_AGENT_ID,
+                        onMessage: (message) => {
+                            console.log('[ElevenLabs] Agent response:', message);
+                        },
+                        clientTools: {
+                            // Example client tool to send data to your server
+                            sendPing: async () => {
+                                try {
+                                    console.log('Sending data to server:');
+                                    console.log(extraBody);
+                                } catch (error) {
+                                    console.error('Error sending data to server:', error);
+                                }
+                            },
+                        },
+                    });
+                    console.log('Conversation started successfully');
+                } catch (error) {
+                    console.error('Failed to start conversation:', error);
+                }
+            
             
             elevenLabsWs.on('open', () => {
                 console.log('[II] Connected to ElevenLabs');
-                console.log('extraBody', extraBody)
+                console.log('extraBody', extraBody);
             });
 
             elevenLabsWs.on('message', (data) => {
