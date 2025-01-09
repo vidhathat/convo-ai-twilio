@@ -5,14 +5,10 @@ const callRecordSchema = new mongoose.Schema({
     type: String,
     required: true
   },
-  callSid: {
+  conversationId: {
     type: String,
     required: true,
     unique: true
-  },
-  conversationId: {
-    type: String,
-    sparse: true
   },
   timestamp: {
     type: Date,

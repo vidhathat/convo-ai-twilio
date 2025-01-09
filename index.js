@@ -51,22 +51,6 @@ fastify.all("/incoming-call-eleven", async (request, reply) => {
   };
   console.log("[Twilio] Call Details:", callDetails);
 
-  try {
-    // Save call record to database
-    const callRecord = new CallRecord({
-      phoneNumber: callDetails.From,
-      callSid: callDetails.CallSid,
-      location: {
-        state: callDetails.FromState,
-        country: callDetails.FromCountry
-      }
-    });
-    await callRecord.save();
-    console.log("[MongoDB] Call record saved successfully");
-  } catch (error) {
-    console.error("[MongoDB] Error saving call record:", error);
-  }
-
   // Generate TwiML response to connect the call to a WebSocket stream
   const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
     <Response>
@@ -85,188 +69,225 @@ fastify.all("/incoming-call-eleven", async (request, reply) => {
 
 // WebSocket route for handling media streams from Twilio
 fastify.register(async (fastifyInstance) => {
-fastifyInstance.get("/media-stream", { websocket: true }, (connection, req) => {
-    console.info("[Server] Twilio connected to media stream.");
+    const callSessions = new Map();  // Store session data for each caller
 
-    let streamSid = null;
-    let elevenLabsWs = null;
-    let conversationId = null;
+    fastifyInstance.get("/media-stream", { websocket: true }, (connection, req) => {
+        console.info("[Server] Twilio connected to media stream.");
 
-    // Handle messages from Twilio
-    connection.on("message", async (message) => {
-    try {
-        const data = JSON.parse(message);
-        switch (data.event) {
-        case "start":
-            streamSid = data.start.streamSid;
-            const customParams = data.start.customParameters;
-            console.log(`[Twilio] Stream started with ID: ${streamSid}`);
-            console.log("[Twilio] Custom parameters:", customParams);
-            const extraBody = {
-              "caller_id": customParams.From,
-          };
-            // Connect to ElevenLabs with caller info
-            const userId = encodeURIComponent(customParams.From || '');
-            console.log("[II] Using caller number as user_id:", customParams.From);
-            // const wsUrl = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${ELEVENLABS_AGENT_ID}&user_id=${userId}`;
-            const wsUrl = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${ELEVENLABS_AGENT_ID}&` + 
-            new URLSearchParams(extraBody).toString()
+        // Initialize session data for this connection
+        const sessionData = {
+            streamSid: null,
+            elevenLabsWs: null,
+            conversationId: null,
+            customParams: null
+        };
+        callSessions.set(connection, sessionData);
 
-            console.log("[II] Full ElevenLabs WebSocket URL:", wsUrl);
+        // Handle messages from Twilio
+        connection.on("message", async (message) => {
+            try {
+                const data = JSON.parse(message);
+                const session = callSessions.get(connection);
 
-            // Initialize ElevenLabs WebSocket connection
-            console.log("[II] Attempting to connect to ElevenLabs...");
-            elevenLabsWs = new WebSocket(wsUrl);
-            
-            elevenLabsWs.on('open', () => {
-                console.log('[II] Connected to ElevenLabs');
-                console.log('extraBody', extraBody)
-            });
+                switch (data.event) {
+                    case "start":
+                        session.streamSid = data.start.streamSid;
+                        session.customParams = data.start.customParameters;
+                        console.log(`[Twilio] Stream started with ID: ${session.streamSid}`);
+                        console.log("[Twilio] Custom parameters:", session.customParams);
+                        
+                        const extraBody = {
+                            "caller_id": session.customParams.From,
+                        };
 
-            elevenLabsWs.on('message', async (data) => {
-                try {
-                    const message = JSON.parse(data);
-                    console.log('[ElevenLabs] Message type:', message.type);
-                    
-                    switch (message.type) {
-                        case "conversation_initiation_metadata":
-                            console.info("[ElevenLabs] Initiation metadata:", JSON.stringify(message, null, 2));
-                            // Extract conversation ID correctly
-                            conversationId = message.conversation_initiation_metadata_event.conversation_id;
-                            console.log("[ElevenLabs] Extracted conversation ID:", conversationId);
-                            
-                            // Update call record with conversation ID
+                        const wsUrl = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${ELEVENLABS_AGENT_ID}&` + 
+                        new URLSearchParams(extraBody).toString();
+
+                        console.log("[II] Full ElevenLabs WebSocket URL:", wsUrl);
+
+                        // Initialize ElevenLabs WebSocket connection
+                        console.log("[II] Attempting to connect to ElevenLabs...");
+                        session.elevenLabsWs = new WebSocket(wsUrl);
+                        
+                        session.elevenLabsWs.on('open', () => {
+                            console.log('[II] Connected to ElevenLabs for caller:', session.customParams.From);
+                            console.log('extraBody', extraBody);
+                        });
+
+                        session.elevenLabsWs.on('message', async (data) => {
                             try {
-                                const result = await CallRecord.findOneAndUpdate(
-                                    { phoneNumber: extraBody.caller_id },
-                                    { conversationId: conversationId },
-                                    { new: true }
-                                );
-                                if (result) {
-                                    console.log("[MongoDB] Updated call record with conversation ID:", conversationId);
-                                } else {
-                                    console.error("[MongoDB] Failed to update call record - not found for phone:", customParams.From);
+                                const message = JSON.parse(data);
+                                console.log('[ElevenLabs] Message type:', message.type);
+                                
+                                switch (message.type) {
+                                    case "conversation_initiation_metadata":
+                                        console.info("[ElevenLabs] Initiation metadata:", JSON.stringify(message, null, 2));
+                                        session.conversationId = message.conversation_initiation_metadata_event.conversation_id;
+                                        console.log("[ElevenLabs] Extracted conversation ID:", session.conversationId);
+                                        
+                                        try {
+                                            // Create new call record
+                                            const callRecord = new CallRecord({
+                                                phoneNumber: session.customParams.From,
+                                                conversationId: session.conversationId,
+                                                location: {
+                                                    country: session.customParams.FromCountry || '',
+                                                    city: session.customParams.FromCity || ''
+                                                }
+                                            });
+                                            await callRecord.save();
+                                            console.log("[MongoDB] Created new call record with conversation ID:", session.conversationId);
+                                        } catch (error) {
+                                            console.error("[MongoDB] Error creating call record:", error);
+                                        }
+                                        break;
+                                    case "text":
+                                        console.info("[ElevenLabs] Agent response for caller:", session.customParams.From, message.text);
+                                        break;
+                                    case "audio":
+                                        if (message.audio_event?.audio_base_64) {
+                                            console.log("[ElevenLabs] Received audio response for caller:", session.customParams.From);
+                                            const audioData = {
+                                                event: "media",
+                                                streamSid: session.streamSid,
+                                                media: {
+                                                    payload: message.audio_event.audio_base_64,
+                                                },
+                                            };
+                                            connection.send(JSON.stringify(audioData));
+                                        }
+                                        break;
                                 }
                             } catch (error) {
-                                console.error("[MongoDB] Error updating conversation ID:", error);
+                                console.error("[ElevenLabs] Error processing message:", error);
                             }
-                            break;
-                        case "text":
-                            console.info("[ElevenLabs] Agent response:", message.text);
-                            break;
-                        case "audio":
-                            if (message.audio_event?.audio_base_64) {
-                                console.log("[ElevenLabs] Received audio response");
-                                const audioData = {
-                                    event: "media",
-                                    streamSid,
-                                    media: {
-                                        payload: message.audio_event.audio_base_64,
-                                    },
-                                };
-                                connection.send(JSON.stringify(audioData));
-                            }
-                            break;
-                    }
-                } catch (error) {
-                    console.error("[ElevenLabs] Error processing message:", error);
-                }
-            });
-
-            elevenLabsWs.on('error', (error) => {
-                console.error('[ElevenLabs] WebSocket error:', error);
-            });
-
-            elevenLabsWs.on('close', async () => {
-                console.log('[ElevenLabs] Connection closed');
-                if (!conversationId) {
-                    console.error('[ElevenLabs] No conversation ID available for transcript fetch');
-                    return;
-                }
-
-                // Wait for 3 seconds before fetching transcript
-                console.log('[ElevenLabs] Waiting 3 seconds before fetching transcript...');
-                await new Promise(resolve => setTimeout(resolve, 3000));
-                
-                try {
-                    console.log('[ElevenLabs] Fetching transcript for conversation:', conversationId);
-                    // Fetch transcript from ElevenLabs
-                    const response = await fetch(
-                        `https://api.elevenlabs.io/v1/convai/conversations/${conversationId}`,
-                        {
-                            headers: {
-                                'xi-api-key': process.env.ELEVENLABS_API_KEY
-                            }
-                        }
-                    );
-
-                    if (!response.ok) {
-                        throw new Error(`ElevenLabs API returned ${response.status}: ${await response.text()}`);
-                    }
-
-                    const transcriptData = await response.json();
-                    console.log('\n[Call Ended] Fetched transcript data');
-
-                    // Save transcript to database
-                    const result = await CallRecord.findOneAndUpdate(
-                        { phoneNumber: customParams.From },
-                        { transcript: transcriptData },
-                        { new: true }
-                    );
-
-                    if (result) {
-                        console.log('[MongoDB] Successfully saved transcript');
-                        console.log('[MongoDB] Record status:', {
-                            phoneNumber: result.phoneNumber,
-                            conversationId: result.conversationId,
-                            hasTranscript: !!result.transcript
                         });
-                    } else {
-                        console.error('[MongoDB] Failed to save transcript - record not found for phone:', customParams.From);
-                    }
-                } catch (error) {
-                    console.error('[ElevenLabs] Error handling transcript:', error);
-                    console.error(error.stack);
+
+                        session.elevenLabsWs.on('close', async () => {
+                            console.log('[ElevenLabs] Connection closed for caller:', session.customParams.From);
+                            if (!session.conversationId) {
+                                console.error('[ElevenLabs] No conversation ID available for transcript fetch');
+                                return;
+                            }
+
+                            console.log('[ElevenLabs] Waiting 3 seconds before fetching transcript...');
+                            await new Promise(resolve => setTimeout(resolve, 3000));
+                            
+                            try {
+                                console.log('[ElevenLabs] Fetching transcript for conversation:', session.conversationId);
+                                const response = await fetch(
+                                    `https://api.elevenlabs.io/v1/convai/conversations/${session.conversationId}`,
+                                    {
+                                        headers: {
+                                            'xi-api-key': process.env.ELEVENLABS_API_KEY
+                                        }
+                                    }
+                                );
+
+                                if (!response.ok) {
+                                    throw new Error(`ElevenLabs API returned ${response.status}: ${await response.text()}`);
+                                }
+
+                                const transcriptData = await response.json();
+                                console.log('\n[Call Ended] Fetched transcript data for caller:', session.customParams.From);
+
+                                // First find the record by conversationId to get its _id
+                                const existingRecord = await CallRecord.findOne({ conversationId: session.conversationId });
+                                
+                                if (!existingRecord) {
+                                    console.error('[MongoDB] Failed to find record for conversation:', session.conversationId);
+                                    return;
+                                }
+
+                                // Update using the exact _id
+                                const result = await CallRecord.findByIdAndUpdate(
+                                    existingRecord._id,
+                                    { transcript: transcriptData },
+                                    { new: true }
+                                );
+
+                                if (result) {
+                                    console.log('[MongoDB] Successfully saved transcript for caller:', session.customParams.From);
+                                    
+                                    // Loop through transcript messages to find tool calls
+                                    const messages = transcriptData.transcript;
+                                    if (messages && Array.isArray(messages)) {
+                                        messages.forEach((msg, index) => {
+                                            if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
+                                                msg.tool_calls.forEach(tool => {
+                                                    const params = JSON.parse(tool.params_as_json);
+                                                    console.log('\n[Tool Call] Details:');
+                                                    console.log('Tool Name:', tool.tool_name);
+                                                    console.log('Request ID:', tool.request_id);
+                                                    console.log('Parameters:');
+                                                    console.log('- Name:', params.name);
+                                                    console.log('- Ticker:', params.ticker);
+                                                    console.log('- Description:', params.description);
+                                                    if (params.fid) console.log('- FID:', params.fid);
+                                                    console.log('------------------------');
+                                                });
+                                            }
+                                        });
+                                    }
+                                } else {
+                                    console.error('[MongoDB] Failed to save transcript - record not found for phone:', session.customParams.From);
+                                }
+                            } catch (error) {
+                                console.error('[ElevenLabs] Error handling transcript:', error);
+                            }
+                        });
+
+                        session.elevenLabsWs.on('error', (error) => {
+                            console.error('[ElevenLabs] WebSocket error for caller:', session.customParams.From, error);
+                        });
+                        break;
+
+                    case "media":
+                        if (session.elevenLabsWs?.readyState === WebSocket.OPEN) {
+                            const audioMessage = {
+                                user_audio_chunk: Buffer.from(
+                                    data.media.payload,
+                                    "base64"
+                                ).toString("base64"),
+                            };
+                            session.elevenLabsWs.send(JSON.stringify(audioMessage));
+                        }
+                        break;
+
+                    case "stop":
+                        if (session.elevenLabsWs) {
+                            session.elevenLabsWs.close();
+                        }
+                        break;
+
+                    default:
+                        console.log(`[Twilio] Received unhandled event: ${data.event}`);
                 }
-            });
-            break;
-        case "media":
-            // Route audio from Twilio to ElevenLabs
-            if (elevenLabsWs.readyState === WebSocket.OPEN) {
-            // data.media.payload is base64 encoded
-            const audioMessage = {
-                user_audio_chunk: Buffer.from(
-                    data.media.payload,
-                    "base64"
-                ).toString("base64"),
-            };
-            elevenLabsWs.send(JSON.stringify(audioMessage));
+            } catch (error) {
+                console.error("[Twilio] Error processing message:", error);
             }
-            break;
-        case "stop":
-            // Close ElevenLabs WebSocket when Twilio stream stops
-            elevenLabsWs.close();
-            break;
-        default:
-            console.log(`[Twilio] Received unhandled event: ${data.event}`);
-        }
-    } catch (error) {
-        console.error("[Twilio] Error processing message:", error);
-    }
-    });
+        });
 
-    // Handle close event from Twilio
-    connection.on("close", () => {
-    elevenLabsWs.close();
-    console.log("[Twilio] Client disconnected");
-    });
+        // Handle close event from Twilio
+        connection.on("close", () => {
+            const session = callSessions.get(connection);
+            if (session?.elevenLabsWs) {
+                session.elevenLabsWs.close();
+            }
+            callSessions.delete(connection);  // Clean up session data
+            console.log("[Twilio] Client disconnected, session cleaned up");
+        });
 
-    // Handle errors from Twilio WebSocket
-    connection.on("error", (error) => {
-    console.error("[Twilio] WebSocket error:", error);
-    elevenLabsWs.close();
+        // Handle errors from Twilio WebSocket
+        connection.on("error", (error) => {
+            const session = callSessions.get(connection);
+            console.error("[Twilio] WebSocket error:", error);
+            if (session?.elevenLabsWs) {
+                session.elevenLabsWs.close();
+            }
+            callSessions.delete(connection);  // Clean up session data
+        });
     });
-});
 });
 
 // Endpoint to handle deploy_token webhook from ElevenLabs
@@ -284,6 +305,56 @@ fastify.post("/api/deploy-token", async (request, reply) => {
         return { success: false, error: error.message };
     }
 });
+
+// Function to fetch and log tool calls from a transcript
+// async function logToolCalls(conversationId) {
+//     try {
+//         console.log('[ElevenLabs] Fetching transcript for conversation:', conversationId);
+//         const response = await fetch(
+//             `https://api.elevenlabs.io/v1/convai/conversations/${conversationId}`,
+//             {
+//                 headers: {
+//                     'xi-api-key': process.env.ELEVENLABS_API_KEY
+//                 }
+//             }
+//         );
+
+//         if (!response.ok) {
+//             throw new Error(`ElevenLabs API returned ${response.status}: ${await response.text()}`);
+//         }
+
+//         const transcriptData = await response.json();
+//         const messages = transcriptData.transcript;
+
+//         if (messages && Array.isArray(messages)) {
+//             messages.forEach((msg, index) => {
+//                 if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
+//                     msg.tool_calls.forEach(tool => {
+//                         const params = JSON.parse(tool.params_as_json);
+//                         console.log('\n[Tool Call] Details:');
+//                         console.log('Tool Name:', tool.tool_name);
+//                         console.log('Request ID:', tool.request_id);
+//                         console.log('Parameters:');
+//                         console.log('- Name:', params.name);
+//                         console.log('- Ticker:', params.ticker);
+//                         console.log('- Description:', params.description);
+//                         if (params.fid) console.log('- FID:', params.fid);
+//                         console.log('------------------------');
+//                     });
+//                 }
+//             });
+//         }
+//     } catch (error) {
+//         console.error('[ElevenLabs] Error fetching/processing transcript:', error);
+//     }
+// }
+
+// // Add a route to trigger the tool calls log
+// fastify.get("/log-tool-calls/:conversationId", async (request, reply) => {
+//     const { conversationId } = request.params;
+//     await logToolCalls(conversationId);
+//     return { success: true, message: "Tool calls logged to console" };
+// });
 
 // Start the Fastify server
 fastify.listen({ port: PORT }, (err) => {
