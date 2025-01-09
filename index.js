@@ -46,10 +46,7 @@ fastify.all("/incoming-call-eleven", async (request, reply) => {
     From: request.body.From,
     To: request.body.To,
     CallSid: request.body.CallSid,
-    Direction: request.body.Direction,
-    FromCity: request.body.FromCity,
     FromState: request.body.FromState,
-    FromZip: request.body.FromZip,
     FromCountry: request.body.FromCountry
   };
   console.log("[Twilio] Call Details:", callDetails);
@@ -60,9 +57,7 @@ fastify.all("/incoming-call-eleven", async (request, reply) => {
       phoneNumber: callDetails.From,
       callSid: callDetails.CallSid,
       location: {
-        city: callDetails.FromCity,
         state: callDetails.FromState,
-        zip: callDetails.FromZip,
         country: callDetails.FromCountry
       }
     });
@@ -128,15 +123,33 @@ fastifyInstance.get("/media-stream", { websocket: true }, (connection, req) => {
                 console.log('extraBody', extraBody)
             });
 
-            elevenLabsWs.on('message', (data) => {
+            elevenLabsWs.on('message', async (data) => {
                 try {
                     const message = JSON.parse(data);
+                    console.log('[ElevenLabs] Message type:', message.type);
                     
                     switch (message.type) {
                         case "conversation_initiation_metadata":
                             console.info("[ElevenLabs] Initiation metadata:", JSON.stringify(message, null, 2));
-                            // Store conversation ID for later use
+                            // Extract conversation ID correctly
                             conversationId = message.conversation_initiation_metadata_event.conversation_id;
+                            console.log("[ElevenLabs] Extracted conversation ID:", conversationId);
+                            
+                            // Update call record with conversation ID
+                            try {
+                                const result = await CallRecord.findOneAndUpdate(
+                                    { phoneNumber: extraBody.caller_id },
+                                    { conversationId: conversationId },
+                                    { new: true }
+                                );
+                                if (result) {
+                                    console.log("[MongoDB] Updated call record with conversation ID:", conversationId);
+                                } else {
+                                    console.error("[MongoDB] Failed to update call record - not found for phone:", customParams.From);
+                                }
+                            } catch (error) {
+                                console.error("[MongoDB] Error updating conversation ID:", error);
+                            }
                             break;
                         case "text":
                             console.info("[ElevenLabs] Agent response:", message.text);
@@ -166,21 +179,54 @@ fastifyInstance.get("/media-stream", { websocket: true }, (connection, req) => {
 
             elevenLabsWs.on('close', async () => {
                 console.log('[ElevenLabs] Connection closed');
-                if (conversationId) {
-                    try {
-                        const response = await fetch(
-                            `https://api.elevenlabs.io/v1/convai/conversations/${conversationId}`,
-                            {
-                                headers: {
-                                    'xi-api-key': process.env.ELEVENLABS_API_KEY
-                                }
+                if (!conversationId) {
+                    console.error('[ElevenLabs] No conversation ID available for transcript fetch');
+                    return;
+                }
+
+                // Wait for 3 seconds before fetching transcript
+                console.log('[ElevenLabs] Waiting 3 seconds before fetching transcript...');
+                await new Promise(resolve => setTimeout(resolve, 3000));
+                
+                try {
+                    console.log('[ElevenLabs] Fetching transcript for conversation:', conversationId);
+                    // Fetch transcript from ElevenLabs
+                    const response = await fetch(
+                        `https://api.elevenlabs.io/v1/convai/conversations/${conversationId}`,
+                        {
+                            headers: {
+                                'xi-api-key': process.env.ELEVENLABS_API_KEY
                             }
-                        );
-                        const transcript = await response.json();
-                        console.log('\n[Call Ended] Conversation Transcript:', transcript);
-                    } catch (error) {
-                        console.error('[ElevenLabs] Error fetching transcript:', error);
+                        }
+                    );
+
+                    if (!response.ok) {
+                        throw new Error(`ElevenLabs API returned ${response.status}: ${await response.text()}`);
                     }
+
+                    const transcriptData = await response.json();
+                    console.log('\n[Call Ended] Fetched transcript data');
+
+                    // Save transcript to database
+                    const result = await CallRecord.findOneAndUpdate(
+                        { phoneNumber: customParams.From },
+                        { transcript: transcriptData },
+                        { new: true }
+                    );
+
+                    if (result) {
+                        console.log('[MongoDB] Successfully saved transcript');
+                        console.log('[MongoDB] Record status:', {
+                            phoneNumber: result.phoneNumber,
+                            conversationId: result.conversationId,
+                            hasTranscript: !!result.transcript
+                        });
+                    } else {
+                        console.error('[MongoDB] Failed to save transcript - record not found for phone:', customParams.From);
+                    }
+                } catch (error) {
+                    console.error('[ElevenLabs] Error handling transcript:', error);
+                    console.error(error.stack);
                 }
             });
             break;
@@ -221,6 +267,22 @@ fastifyInstance.get("/media-stream", { websocket: true }, (connection, req) => {
     elevenLabsWs.close();
     });
 });
+});
+
+// Endpoint to handle deploy_token webhook from ElevenLabs
+fastify.post("/api/deploy-token", async (request, reply) => {
+    console.log("[Deploy Token] Received request:", request.body);
+    try {
+        const { name, ticker, description, fid, conversation_id } = request.body;
+        console.log("[Deploy Token] Received parameters:", request.body);
+        // Validate required parameters
+        reply.code(200);
+        return { success: true, message: "Token deployment request received" };
+    } catch (error) {
+        console.error("[Deploy Token] Error processing request:", error);
+        reply.code(500);
+        return { success: false, error: error.message };
+    }
 });
 
 // Start the Fastify server

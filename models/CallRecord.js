@@ -10,6 +10,10 @@ const callRecordSchema = new mongoose.Schema({
     required: true,
     unique: true
   },
+  conversationId: {
+    type: String,
+    sparse: true
+  },
   timestamp: {
     type: Date,
     default: Date.now
@@ -19,7 +23,15 @@ const callRecordSchema = new mongoose.Schema({
     state: String,
     zip: String,
     country: String
+  },
+  transcript: mongoose.Schema.Types.Mixed,
+  tokenDeployment: {
+    name: String,
+    ticker: String,
+    description: String,
+    fid: String,
+    requestedAt: Date
   }
-});
+}, { timestamps: true });
 
 export default mongoose.model('CallRecord', callRecordSchema); 
