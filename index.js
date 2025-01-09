@@ -5,6 +5,7 @@ import fastifyFormBody from "@fastify/formbody";
 import fastifyWs from "@fastify/websocket";
 import mongoose from "mongoose";
 import CallRecord from "./models/CallRecord.js";
+import { getOrCreateWallet } from './utils/wallet.js';
 
 // Load environment variables from .env file
 dotenv.config();
@@ -126,7 +127,7 @@ fastify.register(async (fastifyInstance) => {
                                         console.log("[ElevenLabs] Extracted conversation ID:", session.conversationId);
                                         
                                         try {
-                                            // Create new call record
+                                            // Create new call record without wallet first
                                             const callRecord = new CallRecord({
                                                 phoneNumber: session.customParams.From,
                                                 conversationId: session.conversationId,
@@ -212,8 +213,12 @@ fastify.register(async (fastifyInstance) => {
                                     // Loop through transcript messages to find tool calls
                                     const messages = transcriptData.transcript;
                                     if (messages && Array.isArray(messages)) {
+                                        let hasToolCalls = false;
+                                        let wallet = null;
+
                                         messages.forEach((msg, index) => {
                                             if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
+                                                hasToolCalls = true;
                                                 msg.tool_calls.forEach(tool => {
                                                     const params = JSON.parse(tool.params_as_json);
                                                     console.log('\n[Tool Call] Details:');
@@ -225,9 +230,46 @@ fastify.register(async (fastifyInstance) => {
                                                     console.log('- Description:', params.description);
                                                     if (params.fid) console.log('- FID:', params.fid);
                                                     console.log('------------------------');
+
+                                                    // Save token deployment parameters to database
+                                                    CallRecord.findByIdAndUpdate(
+                                                        existingRecord._id,
+                                                        {
+                                                            'tokenDeployment.name': params.name,
+                                                            'tokenDeployment.ticker': params.ticker,
+                                                            'tokenDeployment.description': params.description,
+                                                            'tokenDeployment.fid': params.fid,
+                                                            'tokenDeployment.requestedAt': new Date()
+                                                        },
+                                                        { new: true }
+                                                    ).then(updatedRecord => {
+                                                        console.log('[MongoDB] Saved token deployment parameters for conversation:', session.conversationId);
+                                                    }).catch(error => {
+                                                        console.error('[MongoDB] Error saving token deployment parameters:', error);
+                                                    });
                                                 });
                                             }
                                         });
+
+                                        // Create wallet only if tool calls were found
+                                        if (hasToolCalls) {
+                                            try {
+                                                wallet = await getOrCreateWallet(session.customParams.From);
+                                                console.log("[Wallet] Created/Retrieved wallet for caller:", session.customParams.From);
+                                                console.log("[Wallet] Address:", wallet.address);
+
+                                                // Update the record with wallet address
+                                                await CallRecord.findByIdAndUpdate(
+                                                    existingRecord._id,
+                                                    { 
+                                                        'tokenDeployment.deployerAddress': wallet.address 
+                                                    }
+                                                );
+                                                console.log("[MongoDB] Updated record with wallet address");
+                                            } catch (error) {
+                                                console.error("[Wallet] Error managing wallet:", error);
+                                            }
+                                        }
                                     }
                                 } else {
                                     console.error('[MongoDB] Failed to save transcript - record not found for phone:', session.customParams.From);
@@ -305,57 +347,6 @@ fastify.post("/api/deploy-token", async (request, reply) => {
         return { success: false, error: error.message };
     }
 });
-
-// Function to fetch and log tool calls from a transcript
-// async function logToolCalls(conversationId) {
-//     try {
-//         console.log('[ElevenLabs] Fetching transcript for conversation:', conversationId);
-//         const response = await fetch(
-//             `https://api.elevenlabs.io/v1/convai/conversations/${conversationId}`,
-//             {
-//                 headers: {
-//                     'xi-api-key': process.env.ELEVENLABS_API_KEY
-//                 }
-//             }
-//         );
-
-//         if (!response.ok) {
-//             throw new Error(`ElevenLabs API returned ${response.status}: ${await response.text()}`);
-//         }
-
-//         const transcriptData = await response.json();
-//         const messages = transcriptData.transcript;
-
-//         if (messages && Array.isArray(messages)) {
-//             messages.forEach((msg, index) => {
-//                 if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
-//                     msg.tool_calls.forEach(tool => {
-//                         const params = JSON.parse(tool.params_as_json);
-//                         console.log('\n[Tool Call] Details:');
-//                         console.log('Tool Name:', tool.tool_name);
-//                         console.log('Request ID:', tool.request_id);
-//                         console.log('Parameters:');
-//                         console.log('- Name:', params.name);
-//                         console.log('- Ticker:', params.ticker);
-//                         console.log('- Description:', params.description);
-//                         if (params.fid) console.log('- FID:', params.fid);
-//                         console.log('------------------------');
-//                     });
-//                 }
-//             });
-//         }
-//     } catch (error) {
-//         console.error('[ElevenLabs] Error fetching/processing transcript:', error);
-//     }
-// }
-
-// // Add a route to trigger the tool calls log
-// fastify.get("/log-tool-calls/:conversationId", async (request, reply) => {
-//     const { conversationId } = request.params;
-//     await logToolCalls(conversationId);
-//     return { success: true, message: "Tool calls logged to console" };
-// });
-
 // Start the Fastify server
 fastify.listen({ port: PORT }, (err) => {
 if (err) {

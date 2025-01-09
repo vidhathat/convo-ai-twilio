@@ -26,8 +26,10 @@ const callRecordSchema = new mongoose.Schema({
     ticker: String,
     description: String,
     fid: String,
-    requestedAt: Date
+    requestedAt: Date,
+    deployerAddress: String
   }
 }, { timestamps: true });
 
-export default mongoose.model('CallRecord', callRecordSchema); 
+export const CallRecord = mongoose.model('CallRecord', callRecordSchema);
+export default CallRecord; 
